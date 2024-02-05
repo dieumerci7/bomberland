@@ -8,7 +8,7 @@ from components.environment.config import (
     FWD_MODEL_CONNECTION_RETRIES,
 )
 from components.models.dqn import DQN_AGENT_PATH 
-from components.state import observation_to_state
+from components.state_icaart import observation_to_state
 
 
 class DQNAgent(Agent):

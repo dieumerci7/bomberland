@@ -21,7 +21,7 @@ class PPOAgent(Agent):
 
 def main():
     print("============================================================================================")
-    print("PPO agent")
+    print("PPO agent!!!!!!!!!!!!!!!!!")
     print("Connecting to game")
     for retry in range(FWD_MODEL_CONNECTION_RETRIES):
         try:

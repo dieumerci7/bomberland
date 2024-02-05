@@ -7,8 +7,99 @@ from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 
 from components.utils.device import device
+from torch.nn import functional as F
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, lstm_hidden_dim=16, num_lstm_layers=2, hidden_layer_dim=32):
+        super(Actor, self).__init__()
+        # print(f'State_dim = {state_dim}')
+
+        self.lstm = nn.LSTM(input_size=state_dim,
+                            hidden_size=lstm_hidden_dim,
+                            num_layers=num_lstm_layers,
+                            batch_first=True)
+
+        # Calculate the input size for the feed-forward layers
+        # fc_input_size = lstm_hidden_dim * num_lstm_layers
+        fc_input_size = state_dim * lstm_hidden_dim
+        # print(f'fc_input_size = {fc_input_size}')
+
+        # Feed-forward layers
+        self.fc_layers = nn.ModuleList([nn.Linear(fc_input_size if i == 0 else hidden_layer_dim,
+                                                  hidden_layer_dim if i < num_lstm_layers - 2 else action_dim)
+                                        for i in range(num_lstm_layers - 1)])
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, state):
+        if state.ndim == 1:
+            state_view = state.view(1, -1, 1)
+        else:
+            state_view = torch.unsqueeze(state, -1)
+        # print(f'state shape = {state_view.shape}')
+        lstm_out, _ = self.lstm(state_view)
+
+        # Flatten the LSTM output for feed-forward layers
+        # print(f'lstm out shape = {lstm_out.shape}')
+        lstm_out_flat = lstm_out.reshape(lstm_out.size(0), -1)
+        # print(f'true fc_input_size = {lstm_out_flat.size(1)}')
+
+        # Feed-forward layers
+        for fc_layer in self.fc_layers:
+            lstm_out_flat = fc_layer(lstm_out_flat)
+
+        output = self.softmax(lstm_out_flat)
+
+        return output
+
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, lstm_hidden_dim=16, num_lstm_layers=2, hidden_layer_dim=32):
+        super(Critic, self).__init__()
+
+        self.lstm = nn.LSTM(input_size=state_dim,
+                            hidden_size=lstm_hidden_dim,
+                            num_layers=num_lstm_layers,
+                            batch_first=True)
+
+        # Calculate the input size for the feed-forward layers
+        # fc_input_size = lstm_hidden_dim * num_lstm_layers
+        fc_input_size = state_dim * lstm_hidden_dim
+        # print(f'fc_input_size = {fc_input_size}')
+
+        # Feed-forward layers
+        self.fc_layers = nn.ModuleList([nn.Linear(fc_input_size if i == 0 else hidden_layer_dim,
+                                                  hidden_layer_dim if i < num_lstm_layers - 2 else 1)
+                                        for i in range(num_lstm_layers - 1)])
+
+    def forward(self, state):
+        if state.ndim == 1:
+            state_view = state.view(1, -1, 1)
+        else:
+            state_view = torch.unsqueeze(state, -1)
+        # if state.ndim != 1:
+        lstm_out, _ = self.lstm(state_view)
+
+        # Flatten the LSTM output for feed-forward layers
+        lstm_out_flat = lstm_out.reshape(lstm_out.size(0), -1)
+
+        # Feed-forward layers
+        for fc_layer in self.fc_layers:
+            lstm_out_flat = fc_layer(lstm_out_flat)
+
+        output = lstm_out_flat.squeeze(dim=-1)  # Squeeze the last dimension
+
+        return output
+
 
 PPO_AGENT_PATH = "agent_ppo.pt"
+# My code
+# ------
+ENTROPY_COEF = 0.01  # 0.01 is equivalent to author's code
+
+
+# ------
 
 class RolloutBuffer:
     def __init__(self):
@@ -18,7 +109,7 @@ class RolloutBuffer:
         self.rewards = []
         self.state_values = []
         self.is_terminals = []
-    
+
     def clear(self):
         del self.actions[:]
         del self.states[:]
@@ -27,43 +118,46 @@ class RolloutBuffer:
         del self.state_values[:]
         del self.is_terminals[:]
 
+
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init):
         super(ActorCritic, self).__init__()
 
         self.has_continuous_action_space = has_continuous_action_space
-        
+
         if has_continuous_action_space:
             self.action_dim = action_dim
             self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
         # actor
-        if has_continuous_action_space :
+        if has_continuous_action_space:
             self.actor = nn.Sequential(
-                            nn.Linear(state_dim, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, action_dim),
-                            nn.Tanh()
-                        )
+                nn.Linear(state_dim, 64),
+                nn.Tanh(),
+                nn.Linear(64, 64),
+                nn.Tanh(),
+                nn.Linear(64, action_dim),
+                nn.Tanh()
+            )
         else:
             self.actor = nn.Sequential(
-                            nn.Linear(state_dim, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, 64),
-                            nn.Tanh(),
-                            nn.Linear(64, action_dim),
-                            nn.Softmax(dim=-1)
-                        )
+                nn.Linear(state_dim, 512),
+                nn.Tanh(),
+                nn.Linear(512, 512),
+                nn.Tanh(),
+                nn.Linear(512, action_dim),
+                nn.Softmax(dim=-1)
+            )
+            # self.actor = Actor(state_dim=state_dim, action_dim=action_dim)
         # critic
         self.critic = nn.Sequential(
-                        nn.Linear(state_dim, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 1)
-                    )
-        
+            nn.Linear(state_dim, 512),
+            nn.Tanh(),
+            nn.Linear(512, 512),
+            nn.Tanh(),
+            nn.Linear(512, 1)
+        )
+        # self.critic = Critic(state_dim=state_dim)
+
     def set_action_std(self, new_action_std):
         if self.has_continuous_action_space:
             self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(device)
@@ -87,16 +181,16 @@ class ActorCritic(nn.Module):
         state_val = self.critic(state)
 
         return action.detach(), action_logprob.detach(), state_val.detach()
-    
+
     def evaluate(self, state, action):
 
         if self.has_continuous_action_space:
             action_mean = self.actor(state)
-            
+
             action_var = self.action_var.expand_as(action_mean)
             cov_mat = torch.diag_embed(action_var).to(device)
             dist = MultivariateNormal(action_mean, cov_mat)
-            
+
             # For Single Action Environments.
             if self.action_dim == 1:
                 action = action.reshape(-1, self.action_dim)
@@ -106,12 +200,13 @@ class ActorCritic(nn.Module):
         action_logprobs = dist.log_prob(action)
         dist_entropy = dist.entropy()
         state_values = self.critic(state)
-        
+
         return action_logprobs, state_values, dist_entropy
 
 
 class PPO:
-    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std_init=0.6):
+    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
+                 has_continuous_action_space, action_std_init=0.6):
 
         self.has_continuous_action_space = has_continuous_action_space
 
@@ -121,18 +216,18 @@ class PPO:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
-        
+
         self.buffer = RolloutBuffer()
 
         self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
         self.optimizer = torch.optim.Adam([
-                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
-                    ])
+            {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+            {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+        ])
 
         self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
-        
+
         self.MseLoss = nn.MSELoss()
 
     def set_action_std(self, new_action_std):
@@ -178,7 +273,7 @@ class PPO:
             with torch.no_grad():
                 state = torch.FloatTensor(state).to(device)
                 action, action_logprob, state_val = self.policy_old(state)
-            
+
             self.buffer.states.append(state)
             self.buffer.actions.append(action)
             self.buffer.logprobs.append(action_logprob)
@@ -195,7 +290,7 @@ class PPO:
                 discounted_reward = 0
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
-            
+
         # Normalizing the rewards
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
@@ -211,36 +306,35 @@ class PPO:
 
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
-
             # Evaluating old actions and values
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
 
             # match state_values tensor dimensions with rewards tensor
             state_values = torch.squeeze(state_values)
-            
+
             # Finding the ratio (pi_theta / pi_theta__old)
             ratios = torch.exp(logprobs - old_logprobs.detach())
 
-            # Finding Surrogate Loss  
+            # Finding Surrogate Loss
             surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
             # final loss of clipped objective PPO
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
-            
+            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - ENTROPY_COEF * dist_entropy
+
             # take gradient step
             self.optimizer.zero_grad()
             loss.mean().backward()
             self.optimizer.step()
-            
+
         # Copy new weights into old policy
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # clear buffer
         self.buffer.clear()
-    
+
     def save(self):
         torch.save(self.policy_old, PPO_AGENT_PATH)
 
-    def show(self): 
+    def show(self):
         print(self.policy_old)

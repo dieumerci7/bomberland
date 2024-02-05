@@ -7,12 +7,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import numpy as np
 
 from components.environment.config import (
     ACTIONS,
     FWD_MODEL_CONNECTION_DELAY,
-    FWD_MODEL_CONNECTION_RETRIES, 
-    FWD_MODEL_URI, 
+    FWD_MODEL_CONNECTION_RETRIES,
+    FWD_MODEL_URI,
 )
 from components.environment.gym import Gym, GymEnv
 from components.environment.mocks import MOCK_15x15_INITIAL_OBSERVATION
@@ -21,7 +22,7 @@ from components.action import make_action
 from components.reward import calculate_reward
 from components.state_icaart import (
     action_dimensions,
-    state_dimensions, 
+    state_dimensions,
     observation_to_state
 )
 from components.types import State
@@ -47,35 +48,37 @@ EPS_MIN = 0.05
 EPS_MAX = 0.3
 EPS_DECAY = 1000
 PRINT_EVERY = 100
+CONFIDENCE = 2
 
 """
 Epsilon-greedy action selection.
 """
-def select_action(agent: DQNAgent, state: State, steps_done: int, verbose: bool = True):
 
+
+def select_action(agent: DQNAgent, state: State, steps_done: int, actions_taken: np.ndarray, verbose: bool = True):
     agent_id = AGENTS[steps_done % 2]
     unit_id = UNITS[steps_done % 6]
-    
+
     if verbose:
         print(f"Agent: {agent_id}, Unit: {unit_id}")
 
-    eps_threshold = EPS_MIN + (EPS_MAX - EPS_MIN) * \
-        math.exp(-1. * steps_done / EPS_DECAY)
+    uncertainty = np.log(steps_done) / actions_taken
+    uc = CONFIDENCE * np.sqrt(uncertainty)
 
-    if random.random() <= eps_threshold:
-        action = random.randrange(len(ACTIONS))
-    else:
-        with torch.no_grad():
-            probs = agent(state)
-            action = torch.argmax(probs)
+    with torch.no_grad():
+        probs = agent(state)
+        action = torch.argmax(probs + uc)
 
     action = torch.tensor(action, dtype=torch.int64).reshape(1)
 
     return action, (agent_id, unit_id)
 
+
 """
 Optimize memory samples.
 """
+
+
 def optimize_model(policy_net: DQNAgent, target_net: DQNAgent, optimizer, memory: ReplayMemory):
     if len(memory) < BATCH_SIZE:
         return
@@ -89,9 +92,9 @@ def optimize_model(policy_net: DQNAgent, target_net: DQNAgent, optimizer, memory
     # Compute a mask of non-final states and concatenate the batch elements
     # (a final state would've been the one after which simulation ended)
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                          batch.next_state)), device=device, dtype=torch.bool)
+                                            batch.next_state)), device=device, dtype=torch.bool)
     non_final_next_states = torch.stack([s for s in batch.next_state
-                                                 if s is not None])
+                                         if s is not None])
     state_batch = torch.stack(batch.state)
     action_batch = torch.stack(batch.action)
     reward_batch = torch.stack(batch.reward)
@@ -128,25 +131,29 @@ async def train(env: GymEnv, policy_net: DQNAgent, target_net: DQNAgent, optimiz
     cumulative_rewards = []
 
     for epoch in range(EPOCHS):
+        env_idx = epoch % len(env)
         print(f"Started {epoch} epoch...")
         cumulative_reward = 0
 
         # Initialize the environment and get it's state
-        prev_observation = await env.reset()
+        prev_observation = await env[env_idx].reset()
         prev_state = observation_to_state(prev_observation, current_agent_id='a', current_unit_id='c')
+        actions_taken = np.ones(action_dimensions())
 
         # Iterate and gather experience
         for steps_done in range(STEPS):
-            action, (agent_id, unit_id) = select_action(policy_net, prev_state, steps_done)
+            action, (agent_id, unit_id) = select_action(policy_net, prev_state, steps_done, actions_taken)
             action_or_idle = make_action(prev_observation, agent_id, unit_id, action=int(action.item()))
+            actions_taken[int(action.item())] += 1
             action_is_idle = action_or_idle is None
 
             if action_is_idle:
-                next_observation, done, info = await env.step([])
+                next_observation, done, info = await env[env_idx].step([])
             else:
-                next_observation, done, info = await env.step([action_or_idle])
+                next_observation, done, info = await env[env_idx].step([action_or_idle])
 
-            reward = calculate_reward(prev_observation, next_observation, current_agent_id=agent_id, current_unit_id=unit_id)
+            reward = calculate_reward(prev_observation, next_observation, current_agent_id=agent_id,
+                                      current_unit_id=unit_id)
             next_state = observation_to_state(next_observation, current_agent_id=agent_id, current_unit_id=unit_id)
 
             # Store the transition in memory
@@ -160,7 +167,7 @@ async def train(env: GymEnv, policy_net: DQNAgent, target_net: DQNAgent, optimiz
             target_net_state_dict = target_net.state_dict()
             policy_net_state_dict = policy_net.state_dict()
             for key in policy_net_state_dict:
-                target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+                target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1 - TAU)
             target_net.load_state_dict(target_net_state_dict)
 
             prev_state = next_state
@@ -179,9 +186,9 @@ async def train(env: GymEnv, policy_net: DQNAgent, target_net: DQNAgent, optimiz
 
         # Compute statistics
         cumulative_rewards.append(cumulative_reward)
-    
+
     print("Drawing plot: reward distribution over epochs")
-    epochs = range(1, EPOCHS + 1) 
+    epochs = range(1, EPOCHS + 1)
     ax = plt.axes()
     ax.plot(epochs, cumulative_rewards)
     ax.set_title('Cumulative reward by epoch')
@@ -193,7 +200,7 @@ async def train(env: GymEnv, policy_net: DQNAgent, target_net: DQNAgent, optimiz
 
 async def main():
     print("============================================================================================")
-    print("DQN agent")
+    print("DQN agent with UCB")
     print("Connecting to gym")
     gym = Gym(FWD_MODEL_URI)
     for retry in range(1, FWD_MODEL_CONNECTION_RETRIES):
@@ -212,7 +219,7 @@ async def main():
     # env = gym.make("bomberland-gym", MOCK_15x15_INITIAL_OBSERVATION)
     env = [gym.make(f"bomberland-gym_{i}", mock)
            for i, mock in enumerate(MOCK_15x15_INITIAL_OBSERVATION)]
-    observation = await env.reset()
+    observation = await env[0].reset()
     n_states = state_dimensions(observation)
     n_actions = action_dimensions()
     print(f"Agent: states = {n_states}, actions = {n_actions}")
@@ -241,7 +248,7 @@ async def main():
     policy_net.save()
     policy_net.show()
     print("============================================================================================")
-    
+
     await gym.close()
 
 
